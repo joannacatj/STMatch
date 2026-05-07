@@ -435,7 +435,7 @@ namespace STMatch {
 
       memset(slot_labels, 0, sizeof(slot_labels));
 
-      for (int i = 0; i < pat.nnodes; i++) {
+      for (int i = 0; i < pat.nnodes - 1; i++) {
         slot_labels[i][0] = (1 << vertex_labels[i + 1]);
       }
 

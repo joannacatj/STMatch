@@ -706,7 +706,8 @@ namespace STMatch {
     __syncthreads();
 
     if (threadIdx.x % WARP_SIZE == 0) {
-
+      count[local_wid] = 0;
+      mutex_this_block[local_wid] = 0;
       stk[local_wid] = dev_callstack[global_wid];
     }
     __syncwarp();
