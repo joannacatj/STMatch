@@ -1,7 +1,7 @@
 DEBUG =
 
 OPTIONS = -Xptxas -v
-CUDA_ARCH ?= sm_86
+CUDA_ARCH ?= sm_80
 NVCCFLAGS = -std=c++17 $(DEBUG) $(OPTIONS) -arch=$(CUDA_ARCH) -rdc=true -I. -Ineugn -Isrc
 GPU_MATCH = src/gpu_match.cu
 NEUGN_OBJS = bin/neug_model.o bin/tensor_io.o bin/neugn_kernels.o bin/neugn_bridge.o
