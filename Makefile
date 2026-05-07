@@ -1,4 +1,4 @@
-DEBUG = 
+DEBUG =
 
 OPTIONS = -Xptxas -v
 CUDA_ARCH ?= native
@@ -17,7 +17,7 @@ define edit_config
 endef
 
 .PHONY:all
-all:bin/table_vertex_ulb.exe bin/table_edge_ulb.exe bin/table_edge_lb.exe bin/fig_naive.exe bin/fig_local.exe bin/fig_local_global.exe  bin/fig_local_global_unroll.exe 
+all:bin/table_vertex_ulb.exe bin/table_edge_ulb.exe bin/table_edge_lb.exe bin/table_edge_lb_find_first.exe bin/fig_naive.exe bin/fig_local.exe bin/fig_local_global.exe  bin/fig_local_global_unroll.exe
 
 bin/%.exe:bin/%.o cu_test.cu;
 	$(call compile_cu_test,$<,$@)

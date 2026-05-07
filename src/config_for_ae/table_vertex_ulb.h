@@ -3,3 +3,4 @@
   inline constexpr bool EDGE_INDUCED = false;
   inline constexpr bool STEAL_IN_BLOCK = true;
   inline constexpr bool STEAL_ACROSS_BLOCK = false;
+inline constexpr bool FIND_FIRST = false;

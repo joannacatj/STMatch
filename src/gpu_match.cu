@@ -10,6 +10,8 @@ namespace STMatch {
     int* global_mutex;
     int* local_mutex;
     CallStack* global_callstack;
+    int* found;
+    unsigned long long* fms;
   };
 
   __forceinline__ __device__ void lock(int* mutex) {
@@ -18,6 +20,16 @@ namespace STMatch {
   }
   __forceinline__ __device__ void unlock(int* mutex) {
     atomicExch((int*)mutex, 0);
+  }
+
+  __forceinline__ __device__ bool find_first_done(StealingArgs* args) {
+    return FIND_FIRST && atomicAdd(args->found, 0) != 0;
+  }
+
+  __forceinline__ __device__ void count_fms_visit(StealingArgs* args, unsigned long long n = 1) {
+    if (FIND_FIRST && atomicAdd(args->found, 0) == 0) {
+      atomicAdd(args->fms, n);
+    }
   }
 
   __device__ bool trans_layer(CallStack& _target_stk, CallStack& _cur_stk, Pattern* _pat, int _k, int ratio = 2) {
@@ -611,6 +623,13 @@ namespace STMatch {
       }
       __syncwarp();
 
+      if (find_first_done(_stealing_args)) {
+        if (threadIdx.x % WARP_SIZE == 0)
+          unlock(&(_stealing_args->local_mutex[threadIdx.x / WARP_SIZE]));
+        __syncwarp();
+        break;
+      }
+
       if (level < pat->nnodes - 2) {
 
         if (STEAL_ACROSS_BLOCK) {
@@ -629,8 +648,10 @@ namespace STMatch {
         }
         if (stk->uiter[level] < UNROLL_SIZE(level)) {
           if (stk->iter[level] < stk->slot_size[pat->rowptr[level]][stk->uiter[level]]) {
-            if (threadIdx.x % WARP_SIZE == 0)
+            if (threadIdx.x % WARP_SIZE == 0) {
+              count_fms_visit(_stealing_args, level == 0 ? 2 : 1);
               level++;
+            }
             __syncwarp();
           }
           else {
@@ -657,7 +678,17 @@ namespace STMatch {
         extend(g, pat, stk, q, level);
         for (int j = 0; j < UNROLL_SIZE(level); j++) {
           if (threadIdx.x % WARP_SIZE == 0) {
-            *count += stk->slot_size[pat->rowptr[level]][j];
+            if (FIND_FIRST) {
+              if (stk->slot_size[pat->rowptr[level]][j] > 0 && atomicAdd(_stealing_args->found, 0) == 0) {
+                atomicAdd(_stealing_args->fms, 1ULL);
+                if (atomicCAS(_stealing_args->found, 0, 1) == 0) {
+                  *count = 1;
+                }
+              }
+            }
+            else {
+              *count += stk->slot_size[pat->rowptr[level]][j];
+            }
           }
           __syncwarp();
           stk->slot_size[pat->rowptr[level]][j] = 0;
@@ -680,7 +711,8 @@ namespace STMatch {
 
   __global__ void _parallel_match(Graph* dev_graph, Pattern* dev_pattern,
     CallStack* dev_callstack, JobQueue* job_queue, size_t* res,
-    int* idle_warps, int* idle_warps_count, int* global_mutex) {
+    int* idle_warps, int* idle_warps_count, int* global_mutex,
+    int* found, unsigned long long* fms) {
     __shared__ Graph graph;
     __shared__ Pattern pat;
     __shared__ CallStack stk[NWARPS_PER_BLOCK];
@@ -695,6 +727,8 @@ namespace STMatch {
       stealing_args.global_mutex = global_mutex;
       stealing_args.local_mutex = mutex_this_block;
       stealing_args.global_callstack = dev_callstack;
+      stealing_args.found = found;
+      stealing_args.fms = fms;
     }
 
     int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -718,7 +752,10 @@ namespace STMatch {
 
     while (true) {
       match(&graph, &pat, &stk[local_wid], job_queue, &count[local_wid], &stealing_args);
-      __syncwarp();
+      bool stop_after_match = find_first_done(&stealing_args);
+      if (__syncthreads_or(stop_after_match)) {
+        break;
+      }
 
       stealed[local_wid] = false;
 
@@ -745,9 +782,18 @@ namespace STMatch {
 
             unlock(&(stealing_args.global_mutex[blockIdx.x]));
 
-            while ((atomicAdd(stealing_args.idle_warps_count, 0) < NWARPS_TOTAL) && (atomicAdd(&stealing_args.idle_warps[blockIdx.x], 0) & (1 << local_wid)));
+            while ((atomicAdd(stealing_args.idle_warps_count, 0) < NWARPS_TOTAL) &&
+                   (atomicAdd(&stealing_args.idle_warps[blockIdx.x], 0) & (1 << local_wid)) &&
+                   !find_first_done(&stealing_args));
 
-            if (atomicAdd(stealing_args.idle_warps_count, 0) < NWARPS_TOTAL) {
+            if (find_first_done(&stealing_args)) {
+              lock(&(stealing_args.global_mutex[blockIdx.x]));
+              atomicAnd(&stealing_args.idle_warps[blockIdx.x], ~(1 << local_wid));
+              unlock(&(stealing_args.global_mutex[blockIdx.x]));
+              atomicSub(stealing_args.idle_warps_count, 1);
+              stealed[local_wid] = false;
+            }
+            else if (atomicAdd(stealing_args.idle_warps_count, 0) < NWARPS_TOTAL) {
 
               __threadfence();
               if (local_wid == 0) {
@@ -782,8 +828,9 @@ namespace STMatch {
 
   void launch_parallel_match(Graph* dev_graph, Pattern* dev_pattern,
                              CallStack* dev_callstack, JobQueue* job_queue, size_t* res,
-                             int* idle_warps, int* idle_warps_count, int* global_mutex) {
-    _parallel_match << <GRID_DIM, BLOCK_DIM >> > (dev_graph, dev_pattern, dev_callstack, job_queue, res, idle_warps, idle_warps_count, global_mutex);
+                             int* idle_warps, int* idle_warps_count, int* global_mutex,
+                             int* found, unsigned long long* fms) {
+    _parallel_match << <GRID_DIM, BLOCK_DIM >> > (dev_graph, dev_pattern, dev_callstack, job_queue, res, idle_warps, idle_warps_count, global_mutex, found, fms);
   }
 
 }
