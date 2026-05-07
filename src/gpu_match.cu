@@ -779,4 +779,11 @@ namespace STMatch {
     // if(threadIdx.x % WARP_SIZE == 0)
     //   printf("%d\t%d\t%d\n", blockIdx.x, local_wid, mutex_this_block[local_wid]);
   }
+
+  void launch_parallel_match(Graph* dev_graph, Pattern* dev_pattern,
+                             CallStack* dev_callstack, JobQueue* job_queue, size_t* res,
+                             int* idle_warps, int* idle_warps_count, int* global_mutex) {
+    _parallel_match << <GRID_DIM, BLOCK_DIM >> > (dev_graph, dev_pattern, dev_callstack, job_queue, res, idle_warps, idle_warps_count, global_mutex);
+  }
+
 }

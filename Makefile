@@ -20,7 +20,7 @@ all:bin/table_vertex_ulb.exe bin/table_edge_ulb.exe bin/table_edge_lb.exe bin/fi
 
 bin/%.exe:bin/%.o cu_test.cu;
 	$(call compile_cu_test,$<,$@)
-bin/%.o:
+bin/%.o: src/gpu_match.cu src/gpu_match.cuh
 	$(call edit_config,$(patsubst bin/%.o,%.h,$@))
 	$(call compile_gpu_match,src/gpu_match.cu,$@)
 
