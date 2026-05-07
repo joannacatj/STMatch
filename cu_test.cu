@@ -28,7 +28,9 @@ int main(int argc, char* argv[]) {
   for (int i = 0; i < NWARPS_TOTAL; i++) {
     auto& s = stk[i];
     memset(s.iter, 0, sizeof(s.iter));
+    memset(s.uiter, 0, sizeof(s.uiter));
     memset(s.slot_size, 0, sizeof(s.slot_size));
+    s.level = 0;
     s.slot_storage = (graph_node_t(*)[UNROLL][GRAPH_DEGREE])((char*)slot_storage + i * sizeof(graph_node_t) * MAX_SLOT_NUM * UNROLL * GRAPH_DEGREE);
   }
   cudaMalloc(&gpu_callstack, NWARPS_TOTAL * sizeof(CallStack));
