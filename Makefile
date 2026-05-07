@@ -1,14 +1,15 @@
 DEBUG = 
 
 OPTIONS = -Xptxas -v
+CUDA_ARCH ?= native
 GPU_MATCH = src/gpu_match.cu
 
 define compile_cu_test
-	nvcc -std=c++17 $(DEBUG) $(OPTIONS) -arch=compute_86 $(1) cu_test.cu -o $(2)
+	nvcc -std=c++17 $(DEBUG) $(OPTIONS) -arch=$(CUDA_ARCH) $(1) cu_test.cu -o $(2)
 endef
 
 define compile_gpu_match
-	nvcc -std=c++17 $(DEBUG) $(OPTIONS) -arch=compute_86 -c -I. $(1) -o $(2)
+	nvcc -std=c++17 $(DEBUG) $(OPTIONS) -arch=$(CUDA_ARCH) -c -I. $(1) -o $(2)
 endef
 
 define edit_config
