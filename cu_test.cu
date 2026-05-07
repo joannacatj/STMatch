@@ -28,7 +28,9 @@ int main(int argc, char* argv[]) {
   for (int i = 0; i < NWARPS_TOTAL; i++) {
     auto& s = stk[i];
     memset(s.iter, 0, sizeof(s.iter));
+    memset(s.uiter, 0, sizeof(s.uiter));
     memset(s.slot_size, 0, sizeof(s.slot_size));
+    s.level = 0;
     s.slot_storage = (graph_node_t(*)[UNROLL][GRAPH_DEGREE])((char*)slot_storage + i * sizeof(graph_node_t) * MAX_SLOT_NUM * UNROLL * GRAPH_DEGREE);
   }
   cudaMalloc(&gpu_callstack, NWARPS_TOTAL * sizeof(CallStack));
@@ -38,6 +40,14 @@ int main(int argc, char* argv[]) {
   cudaMalloc(&gpu_res, sizeof(size_t) * NWARPS_TOTAL);
   cudaMemset(gpu_res, 0, sizeof(size_t) * NWARPS_TOTAL);
   size_t* res = new size_t[NWARPS_TOTAL];
+
+  int* gpu_found;
+  cudaMalloc(&gpu_found, sizeof(int));
+  cudaMemset(gpu_found, 0, sizeof(int));
+
+  unsigned long long* gpu_fms;
+  cudaMalloc(&gpu_fms, sizeof(unsigned long long));
+  cudaMemset(gpu_fms, 0, sizeof(unsigned long long));
 
   int* idle_warps;
   cudaMalloc(&idle_warps, sizeof(int) * GRID_DIM);
@@ -63,12 +73,21 @@ int main(int argc, char* argv[]) {
 
   //cout << "shared memory usage: " << sizeof(Graph) << " " << sizeof(Pattern) << " " << sizeof(JobQueue) << " " << sizeof(CallStack) * NWARPS_PER_BLOCK << " " << NWARPS_PER_BLOCK * 33 * sizeof(int) << " Bytes" << endl;
 
-  _parallel_match << <GRID_DIM, BLOCK_DIM >> > (gpu_graph, gpu_pattern, gpu_callstack, gpu_queue, gpu_res, idle_warps, idle_warps_count, global_mutex);
+  launch_parallel_match(gpu_graph, gpu_pattern, gpu_callstack, gpu_queue, gpu_res, idle_warps, idle_warps_count, global_mutex, gpu_found, gpu_fms);
 
+  cudaError_t launch_status = cudaGetLastError();
+  if (launch_status != cudaSuccess) {
+    std::cerr << "Kernel launch failed: " << cudaGetErrorString(launch_status) << std::endl;
+    return 1;
+  }
 
   cudaEventRecord(stop);
 
-  cudaEventSynchronize(stop);
+  cudaError_t sync_status = cudaEventSynchronize(stop);
+  if (sync_status != cudaSuccess) {
+    std::cerr << "Kernel execution failed: " << cudaGetErrorString(sync_status) << std::endl;
+    return 1;
+  }
 
   float milliseconds = 0;
   cudaEventElapsedTime(&milliseconds, start, stop);
@@ -79,9 +98,23 @@ int main(int argc, char* argv[]) {
   unsigned long long tot_count = 0;
   for (int i=0; i<NWARPS_TOTAL; i++) tot_count += res[i];
 
-  if(!LABELED) tot_count = tot_count * p.PatternMultiplicity;
-  
-  printf("%s\t%f\t%llu\n", argv[2], milliseconds, tot_count);
+  unsigned long long fms = 0;
+  if (FIND_FIRST) {
+    int found = 0;
+    cudaMemcpy(&found, gpu_found, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&fms, gpu_fms, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+    tot_count = found ? 1 : 0;
+  }
+  else if(!LABELED) {
+    tot_count = tot_count * p.PatternMultiplicity;
+  }
+
+  if (FIND_FIRST) {
+    printf("%s\t%f\t%llu\t%llu\n", argv[2], milliseconds, tot_count, fms);
+  }
+  else {
+    printf("%s\t%f\t%llu\n", argv[2], milliseconds, tot_count);
+  }
   //cout << "count: " << tot_count << endl;
   return 0;
 }

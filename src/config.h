@@ -12,10 +12,10 @@ namespace STMatch {
   inline constexpr size_t GRAPH_DEGREE = 4096;
   inline constexpr size_t MAX_SLOT_NUM = 15;
 
-#include "config_for_ae/fig_local_global_unroll.h" 
+#include "config_for_ae/table_edge_lb_find_first.h" 
 
   inline constexpr int GRID_DIM = 82;
-  inline constexpr int BLOCK_DIM = 1024;
+  inline constexpr int BLOCK_DIM = 512;
   inline constexpr int WARP_SIZE = 32;
   inline constexpr int NWARPS_PER_BLOCK = (BLOCK_DIM / WARP_SIZE);
   inline constexpr int NWARPS_TOTAL = ((GRID_DIM * BLOCK_DIM + WARP_SIZE - 1) / WARP_SIZE);

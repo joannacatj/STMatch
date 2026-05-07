@@ -2,6 +2,9 @@
 #pragma once
 
 #include <string>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <iostream>
@@ -9,7 +12,9 @@
 #include <vector>
 #include <set>
 #include <cassert>
+#include <unordered_map>
 #include "config.h"
+#include "label_map.h"
 
 
 namespace STMatch {
@@ -65,38 +70,134 @@ namespace STMatch {
     }
 
     void readfile(std::string& filename) {
-      //std::cout << filename << std::endl;
-
       std::ifstream fin(filename);
-      std::string line;
-      while (std::getline(fin, line) && (line[0] == '#'));
-      pat.nnodes = 0;
+      if (!fin.good()) {
+        std::cerr << "Failed to open pattern file: " << filename << "\n";
+        exit(1);
+      }
 
-      do {
-        std::istringstream sin(line);
-        char tmp;
-        int v;
-        int label;
-        sin >> tmp >> v >> label;
-        if(LABELED){
-          vertex_labels.push_back(label);
-        }
-        else{
-          vertex_labels.push_back(1);
-        }
-        pat.nnodes++;
-      } while (std::getline(fin, line) && (line[0] == 'v'));
+      std::vector<std::string> lines;
+      std::string line;
+      while (std::getline(fin, line)) {
+        size_t first_char = line.find_first_not_of(" \t\r\n");
+        if (first_char == std::string::npos) continue;
+        if (line[first_char] == '#') continue;
+        lines.push_back(line.substr(first_char));
+      }
+      if (lines.empty()) {
+        std::cerr << "Pattern file is empty: " << filename << "\n";
+        exit(1);
+      }
 
       memset(adj_matrix_, 0, sizeof(adj_matrix_));
-      do {
-        std::istringstream sin(line);
-        char tmp;
-        int v1, v2;
-        int label;
-        sin >> tmp >> v1 >> v2 >> label;
-        adj_matrix_[v1][v2] = label;
-        adj_matrix_[v2][v1] = label;
-      } while (getline(fin, line));
+      vertex_labels.clear();
+      std::unordered_map<uint64_t, int> id_map;
+      std::vector<int> input_degrees;
+      bool new_format = false;
+      uint64_t expected_vertices = 0, expected_edges = 0;
+      size_t start_line = 0;
+
+      std::istringstream first(lines[0]);
+      char first_tag;
+      first >> first_tag;
+      if (first_tag == 't') {
+        if (!(first >> expected_vertices >> expected_edges)) {
+          std::cerr << "New pattern format must start with: t N M\n";
+          exit(1);
+        }
+        if (expected_vertices > PAT_SIZE) {
+          std::cerr << "Pattern has too many vertices for PAT_SIZE: " << expected_vertices << "\n";
+          exit(1);
+        }
+        new_format = true;
+        pat.nnodes = static_cast<pattern_node_t>(expected_vertices);
+        input_degrees.assign(expected_vertices, -1);
+        start_line = 1;
+      }
+      else if (first_tag != 'v') {
+        std::cerr << "Pattern file must start with a vertex line or t N M\n";
+        exit(1);
+      }
+
+      uint64_t vertex_count = 0, edge_count = 0;
+      for (size_t i = start_line; i < lines.size(); i++) {
+        std::istringstream sin(lines[i]);
+        char tag;
+        sin >> tag;
+        if (tag == 'v') {
+          uint64_t external_id, raw_label, degree = 0;
+          if (new_format) {
+            if (!(sin >> external_id >> raw_label >> degree)) {
+              std::cerr << "Invalid new-format pattern vertex line: " << lines[i] << "\n";
+              exit(1);
+            }
+            if (vertex_count >= expected_vertices) {
+              std::cerr << "More pattern vertices than declared\n";
+              exit(1);
+            }
+          }
+          else if (!(sin >> external_id >> raw_label)) {
+            std::cerr << "Invalid old-format pattern vertex line: " << lines[i] << "\n";
+            exit(1);
+          }
+
+          int internal_id = static_cast<int>(vertex_count++);
+          if (internal_id >= static_cast<int>(PAT_SIZE)) {
+            std::cerr << "Pattern has too many vertices for PAT_SIZE\n";
+            exit(1);
+          }
+          if (!id_map.emplace(external_id, internal_id).second) {
+            std::cerr << "Duplicate pattern vertex id: " << external_id << "\n";
+            exit(1);
+          }
+          vertex_labels.push_back(LABELED ? get_compact_label(raw_label) : 1);
+          if (new_format) input_degrees[internal_id] = static_cast<int>(degree);
+        }
+        else if (tag == 'e') {
+          uint64_t external_u, external_v;
+          if (!(sin >> external_u >> external_v)) {
+            std::cerr << "Invalid pattern edge line: " << lines[i] << "\n";
+            exit(1);
+          }
+          auto it_u = id_map.find(external_u);
+          auto it_v = id_map.find(external_v);
+          if (it_u == id_map.end() || it_v == id_map.end()) {
+            std::cerr << "Pattern edge references an unknown vertex: " << lines[i] << "\n";
+            exit(1);
+          }
+          adj_matrix_[it_u->second][it_v->second] = 1;
+          adj_matrix_[it_v->second][it_u->second] = 1;
+          edge_count++;
+        }
+        else {
+          std::cerr << "Unknown line type in pattern file: " << lines[i] << "\n";
+          exit(1);
+        }
+      }
+
+      if (new_format) {
+        if (vertex_count != expected_vertices || edge_count != expected_edges) {
+          std::cerr << "Pattern count mismatch: declared (" << expected_vertices << ", " << expected_edges
+                    << ") but read (" << vertex_count << ", " << edge_count << ")\n";
+          exit(1);
+        }
+      }
+      else {
+        pat.nnodes = static_cast<pattern_node_t>(vertex_count);
+      }
+      assert(vertex_count <= PAT_SIZE);
+
+      if (new_format) {
+        for (int i = 0; i < pat.nnodes; i++) {
+          int actual_degree = 0;
+          for (int j = 0; j < pat.nnodes; j++) actual_degree += (adj_matrix_[i][j] > 0);
+          if (input_degrees[i] != actual_degree) {
+            std::cerr << "Pattern degree mismatch for internal vertex " << i << ": declared "
+                      << input_degrees[i] << ", actual " << actual_degree << "\n";
+            exit(1);
+          }
+        }
+      }
     }
 
 
@@ -334,7 +435,7 @@ namespace STMatch {
 
       memset(slot_labels, 0, sizeof(slot_labels));
 
-      for (int i = 0; i < pat.nnodes; i++) {
+      for (int i = 0; i < pat.nnodes - 1; i++) {
         slot_labels[i][0] = (1 << vertex_labels[i + 1]);
       }
 
