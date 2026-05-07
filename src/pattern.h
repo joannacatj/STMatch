@@ -47,11 +47,18 @@ namespace STMatch {
 
     std::vector<int> vertex_labels;
 
+    std::vector<int> query_edge_src_for_neugn;
+    std::vector<int> query_edge_dst_for_neugn;
+    std::vector<int> query_labels_for_neugn;
+    std::vector<std::vector<int>> query_adj_for_neugn;
+    int query_n_for_neugn = 0;
+
     int length[PAT_SIZE];
     int edge[PAT_SIZE][PAT_SIZE];
 
     PatternPreprocessor(std::string filename) {
       readfile(filename);
+      build_neugn_query_views();
       get_matching_order();
       get_partial_order();
       get_set_ops();
@@ -197,6 +204,34 @@ namespace STMatch {
             exit(1);
           }
         }
+      }
+    }
+
+    void build_neugn_query_views() {
+      query_n_for_neugn = pat.nnodes;
+      query_labels_for_neugn.assign(query_n_for_neugn, 0);
+      query_adj_for_neugn.assign(query_n_for_neugn, std::vector<int>());
+      query_edge_src_for_neugn.clear();
+      query_edge_dst_for_neugn.clear();
+
+      for (int i = 0; i < query_n_for_neugn; i++) {
+        query_labels_for_neugn[i] = (i < static_cast<int>(vertex_labels.size())) ? vertex_labels[i] : 0;
+      }
+
+      for (int u = 0; u < query_n_for_neugn; u++) {
+        for (int v = u + 1; v < query_n_for_neugn; v++) {
+          if (adj_matrix_[u][v] > 0) {
+            query_edge_src_for_neugn.push_back(u);
+            query_edge_dst_for_neugn.push_back(v);
+            query_edge_src_for_neugn.push_back(v);
+            query_edge_dst_for_neugn.push_back(u);
+            query_adj_for_neugn[u].push_back(v);
+            query_adj_for_neugn[v].push_back(u);
+          }
+        }
+      }
+      for (auto& adj : query_adj_for_neugn) {
+        std::sort(adj.begin(), adj.end());
       }
     }
 

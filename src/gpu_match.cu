@@ -12,6 +12,10 @@ namespace STMatch {
     CallStack* global_callstack;
     int* found;
     unsigned long long* fms;
+    NeuGNRequest* neugn_requests;
+    int* neugn_request_count;
+    int neugn_request_capacity;
+    int* active_warps;
   };
 
   __forceinline__ __device__ void lock(int* mutex) {
@@ -119,6 +123,8 @@ namespace STMatch {
       _cur_stk.slot_size[_pat->rowptr[_pat->nnodes - 1]][u] = 0;
     }
     _cur_stk.level = _k + 1;
+    _cur_stk.active = 1;
+    _cur_stk.paused_for_neugn = 0;
     return true;
   }
 
@@ -612,10 +618,71 @@ namespace STMatch {
     }
   }
 
+  __forceinline__ __device__ void fill_mapping_from_stmatch_stack(
+      CallStack* stk, Pattern* pat, int level, int request_unroll_id, graph_node_t* mapping) {
+    for (int i = 0; i < PAT_SIZE; i++) mapping[i] = -1;
+    if (pat->nnodes <= 0) return;
+    if (level <= 0) return;
+
+    int first_edge_unroll = (level == 1) ? request_unroll_id : stk->uiter[1];
+    mapping[0] = path(stk, pat, -1, first_edge_unroll);
+    if (pat->nnodes > 1) mapping[1] = path(stk, pat, 0, first_edge_unroll);
+
+    for (int q = 2; q <= level && q < pat->nnodes; q++) {
+      int u = (q == level) ? request_unroll_id : stk->uiter[q];
+      mapping[q] = path(stk, pat, q - 1, u);
+    }
+  }
+
+  __device__ bool register_neugn_requests_for_level(
+      Pattern* pat, CallStack* stk, int global_wid, int level, StealingArgs* args) {
+    if (!USE_NEUGN || args->neugn_requests == nullptr || args->neugn_request_count == nullptr || args->active_warps == nullptr)
+      return false;
+    if (level < NEUGN_START_LEVEL || level > NEUGN_END_LEVEL || level < 1) return false;
+    int qnode = level + 1;
+    if (qnode >= pat->nnodes) return false;
+    int slot = pat->rowptr[level];
+    bool recorded = false;
+
+    for (int u = 0; u < UNROLL_SIZE(level); u++) {
+      int cand_len = stk->slot_size[slot][u];
+      if (cand_len <= 1) continue;
+      int rid = atomicAdd(args->neugn_request_count, 1);
+      if (rid >= args->neugn_request_capacity) {
+        atomicSub(args->neugn_request_count, 1);
+        continue;
+      }
+      NeuGNRequest* req = &args->neugn_requests[rid];
+      req->warp_id = global_wid;
+      req->level = level;
+      req->slot = slot;
+      req->unroll_id = u;
+      req->cand_len = cand_len;
+      req->qnode = qnode;
+      fill_mapping_from_stmatch_stack(stk, pat, level, u, req->mapping);
+      recorded = true;
+    }
+
+    if (recorded) {
+      stk->paused_for_neugn = 1;
+      stk->active = 1;
+      atomicAdd(args->active_warps, 1);
+    }
+    return recorded;
+  }
+
   __device__ void match(Graph* g, Pattern* pat,
-    CallStack* stk, JobQueue* q, size_t* count, StealingArgs* _stealing_args) {
+    CallStack* stk, JobQueue* q, size_t* count, StealingArgs* _stealing_args, int global_wid) {
 
     pattern_node_t& level = stk->level;
+
+    if (MULTI_KERNEL_DFS && !stk->active) return;
+    if (USE_NEUGN && stk->paused_for_neugn) {
+      if (threadIdx.x % WARP_SIZE == 0 && _stealing_args->active_warps != nullptr)
+        atomicAdd(_stealing_args->active_warps, 1);
+      __syncwarp();
+      return;
+    }
 
     while (true) {
       if (threadIdx.x % WARP_SIZE == 0) {
@@ -624,8 +691,11 @@ namespace STMatch {
       __syncwarp();
 
       if (find_first_done(_stealing_args)) {
-        if (threadIdx.x % WARP_SIZE == 0)
+        if (threadIdx.x % WARP_SIZE == 0) {
+          stk->active = 0;
+          stk->paused_for_neugn = 0;
           unlock(&(_stealing_args->local_mutex[threadIdx.x / WARP_SIZE]));
+        }
         __syncwarp();
         break;
       }
@@ -640,10 +710,25 @@ namespace STMatch {
 
           extend(g, pat, stk, q, level);
           if (level == 0 && stk->slot_size[0][0] == 0) {
-            if (threadIdx.x % WARP_SIZE == 0)
+            if (threadIdx.x % WARP_SIZE == 0) {
+              stk->active = 0;
+              stk->paused_for_neugn = 0;
               unlock(&(_stealing_args->local_mutex[threadIdx.x / WARP_SIZE]));
+            }
             __syncwarp();
             break;
+          }
+          if (USE_NEUGN) {
+            bool paused = false;
+            if (threadIdx.x % WARP_SIZE == 0)
+              paused = register_neugn_requests_for_level(pat, stk, global_wid, level, _stealing_args);
+            paused = __shfl_sync(0xFFFFFFFF, paused, 0);
+            if (paused) {
+              if (threadIdx.x % WARP_SIZE == 0)
+                unlock(&(_stealing_args->local_mutex[threadIdx.x / WARP_SIZE]));
+              __syncwarp();
+              return;
+            }
           }
         }
         if (stk->uiter[level] < UNROLL_SIZE(level)) {
@@ -712,7 +797,9 @@ namespace STMatch {
   __global__ void _parallel_match(Graph* dev_graph, Pattern* dev_pattern,
     CallStack* dev_callstack, JobQueue* job_queue, size_t* res,
     int* idle_warps, int* idle_warps_count, int* global_mutex,
-    int* found, unsigned long long* fms) {
+    int* found, unsigned long long* fms,
+    NeuGNRequest* neugn_requests, int* neugn_request_count,
+    int neugn_request_capacity, int* active_warps) {
     __shared__ Graph graph;
     __shared__ Pattern pat;
     __shared__ CallStack stk[NWARPS_PER_BLOCK];
@@ -729,6 +816,10 @@ namespace STMatch {
       stealing_args.global_callstack = dev_callstack;
       stealing_args.found = found;
       stealing_args.fms = fms;
+      stealing_args.neugn_requests = neugn_requests;
+      stealing_args.neugn_request_count = neugn_request_count;
+      stealing_args.neugn_request_capacity = neugn_request_capacity;
+      stealing_args.active_warps = active_warps;
     }
 
     int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -751,9 +842,10 @@ namespace STMatch {
     auto start = clock64();
 
     while (true) {
-      match(&graph, &pat, &stk[local_wid], job_queue, &count[local_wid], &stealing_args);
+      match(&graph, &pat, &stk[local_wid], job_queue, &count[local_wid], &stealing_args, global_wid);
       bool stop_after_match = find_first_done(&stealing_args);
-      if (__syncthreads_or(stop_after_match)) {
+      bool paused_after_match = USE_NEUGN && stk[local_wid].paused_for_neugn;
+      if (__syncthreads_or(stop_after_match || paused_after_match)) {
         break;
       }
 
@@ -817,11 +909,19 @@ namespace STMatch {
     auto stop = clock64();
 
     if (threadIdx.x % WARP_SIZE == 0) {
-      res[global_wid] = count[local_wid];
+      if (MULTI_KERNEL_DFS) {
+        atomicAdd(reinterpret_cast<unsigned long long*>(&res[global_wid]), static_cast<unsigned long long>(count[local_wid]));
+        if (stk[local_wid].active && !stk[local_wid].paused_for_neugn && active_warps != nullptr) {
+          atomicAdd(active_warps, 1);
+        }
+      }
+      else {
+        res[global_wid] = count[local_wid];
+      }
+      dev_callstack[global_wid] = stk[local_wid];
       // printf("%d\t%ld\t%d\t%d\n", blockIdx.x, stop - start, stealed[local_wid], local_wid);
       //printf("%ld\n", stop - start);
     }
-
     // if(threadIdx.x % WARP_SIZE == 0)
     //   printf("%d\t%d\t%d\n", blockIdx.x, local_wid, mutex_this_block[local_wid]);
   }
@@ -829,8 +929,11 @@ namespace STMatch {
   void launch_parallel_match(Graph* dev_graph, Pattern* dev_pattern,
                              CallStack* dev_callstack, JobQueue* job_queue, size_t* res,
                              int* idle_warps, int* idle_warps_count, int* global_mutex,
-                             int* found, unsigned long long* fms) {
-    _parallel_match << <GRID_DIM, BLOCK_DIM >> > (dev_graph, dev_pattern, dev_callstack, job_queue, res, idle_warps, idle_warps_count, global_mutex, found, fms);
+                             int* found, unsigned long long* fms,
+                             NeuGNRequest* neugn_requests, int* neugn_request_count,
+                             int neugn_request_capacity, int* active_warps) {
+    _parallel_match << <GRID_DIM, BLOCK_DIM >> > (dev_graph, dev_pattern, dev_callstack, job_queue, res, idle_warps, idle_warps_count, global_mutex, found, fms,
+                                                 neugn_requests, neugn_request_count, neugn_request_capacity, active_warps);
   }
 
 }
