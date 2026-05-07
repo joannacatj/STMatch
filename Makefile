@@ -8,7 +8,7 @@ define compile_cu_test
 endef
 
 define compile_gpu_match
-	nvcc -std=c++17 $(DEBUG) $(OPTIONS) -arch=compute_86 -dc -I. $(1) -o $(2)
+	nvcc -std=c++17 $(DEBUG) $(OPTIONS) -arch=compute_86 -c -I. $(1) -o $(2)
 endef
 
 define edit_config
