@@ -689,11 +689,13 @@ namespace STMatch {
     __shared__ int mutex_this_block[NWARPS_PER_BLOCK];
 
     __shared__ StealingArgs stealing_args;
-    stealing_args.idle_warps = idle_warps;
-    stealing_args.idle_warps_count = idle_warps_count;
-    stealing_args.global_mutex = global_mutex;
-    stealing_args.local_mutex = mutex_this_block;
-    stealing_args.global_callstack = dev_callstack;
+    if (threadIdx.x == 0) {
+      stealing_args.idle_warps = idle_warps;
+      stealing_args.idle_warps_count = idle_warps_count;
+      stealing_args.global_mutex = global_mutex;
+      stealing_args.local_mutex = mutex_this_block;
+      stealing_args.global_callstack = dev_callstack;
+    }
 
     int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
     int global_wid = global_tid / WARP_SIZE;
@@ -710,7 +712,7 @@ namespace STMatch {
       mutex_this_block[local_wid] = 0;
       stk[local_wid] = dev_callstack[global_wid];
     }
-    __syncwarp();
+    __syncthreads();
 
     auto start = clock64();
 

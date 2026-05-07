@@ -67,10 +67,19 @@ int main(int argc, char* argv[]) {
 
   _parallel_match << <GRID_DIM, BLOCK_DIM >> > (gpu_graph, gpu_pattern, gpu_callstack, gpu_queue, gpu_res, idle_warps, idle_warps_count, global_mutex);
 
+  cudaError_t launch_status = cudaGetLastError();
+  if (launch_status != cudaSuccess) {
+    std::cerr << "Kernel launch failed: " << cudaGetErrorString(launch_status) << std::endl;
+    return 1;
+  }
 
   cudaEventRecord(stop);
 
-  cudaEventSynchronize(stop);
+  cudaError_t sync_status = cudaEventSynchronize(stop);
+  if (sync_status != cudaSuccess) {
+    std::cerr << "Kernel execution failed: " << cudaGetErrorString(sync_status) << std::endl;
+    return 1;
+  }
 
   float milliseconds = 0;
   cudaEventElapsedTime(&milliseconds, start, stop);

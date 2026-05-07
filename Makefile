@@ -18,7 +18,7 @@ endef
 .PHONY:all
 all:bin/table_vertex_ulb.exe bin/table_edge_ulb.exe bin/table_edge_lb.exe bin/fig_naive.exe bin/fig_local.exe bin/fig_local_global.exe  bin/fig_local_global_unroll.exe 
 
-bin/%.exe:bin/%.o;
+bin/%.exe:bin/%.o cu_test.cu;
 	$(call compile_cu_test,$<,$@)
 bin/%.o:
 	$(call edit_config,$(patsubst bin/%.o,%.h,$@))
