@@ -31,7 +31,7 @@ namespace STMatch {
   }
 
   __forceinline__ __device__ void count_fms_visit(StealingArgs* args, unsigned long long n = 1) {
-    if (FIND_FIRST && atomicAdd(args->found, 0) == 0) {
+    if (n > 0 && FIND_FIRST && atomicAdd(args->found, 0) == 0) {
       atomicAdd(args->fms, n);
     }
   }
@@ -41,11 +41,13 @@ namespace STMatch {
            atomicAdd(args->neugn_request_count, 0) > 0;
   }
 
-  // FMS counts candidate assignments that are actually expanded. With loop
-  // unrolling, one DFS advance can expand a batch of assignments, but it must
-  // not count the generated candidate-list length.
+  // FMS counts candidate assignments that are actually expanded. It must not
+  // count generated candidate-list length. The parent of the final level is
+  // counted inside the final-level loop so a find-first hit in lane j only
+  // charges lanes 0..j rather than the whole unrolled batch.
   __forceinline__ __device__ unsigned long long fms_assignment_visits(
       CallStack* stk, Pattern* pat, int level) {
+    if (FIND_FIRST && level == pat->nnodes - 3) return 0ULL;
     int slot = pat->rowptr[level];
     int u = stk->uiter[level];
     int remaining = stk->slot_size[slot][u] - stk->iter[level];
@@ -53,6 +55,16 @@ namespace STMatch {
     int unroll_visits = UNROLL_SIZE(level + 1);
     int visits = remaining < unroll_visits ? remaining : unroll_visits;
     return static_cast<unsigned long long>(visits) * (level == 0 ? 2ULL : 1ULL);
+  }
+
+  __forceinline__ __device__ int fms_final_prefix_lanes(CallStack* stk, Pattern* pat, int final_level) {
+    int parent_level = final_level - 1;
+    int slot = pat->rowptr[parent_level];
+    int u = stk->uiter[parent_level];
+    int remaining = stk->slot_size[slot][u] - stk->iter[parent_level];
+    if (remaining <= 0) return 0;
+    int unroll_visits = UNROLL_SIZE(final_level);
+    return remaining < unroll_visits ? remaining : unroll_visits;
   }
 
   __device__ bool trans_layer(CallStack& _target_stk, CallStack& _cur_stk, Pattern* _pat, int _k, int ratio = 2) {
@@ -779,14 +791,18 @@ namespace STMatch {
       }
       else if (level == pat->nnodes - 2) {
 
+        int final_prefix_lanes = fms_final_prefix_lanes(stk, pat, level);
         extend(g, pat, stk, q, level);
         for (int j = 0; j < UNROLL_SIZE(level); j++) {
           if (threadIdx.x % WARP_SIZE == 0) {
             if (FIND_FIRST) {
-              if (stk->slot_size[pat->rowptr[level]][j] > 0 && atomicAdd(_stealing_args->found, 0) == 0) {
-                atomicAdd(_stealing_args->fms, 1ULL);
-                if (atomicCAS(_stealing_args->found, 0, 1) == 0) {
-                  *count = 1;
+              if (j < final_prefix_lanes && atomicAdd(_stealing_args->found, 0) == 0) {
+                count_fms_visit(_stealing_args, level == 1 ? 2ULL : 1ULL);
+                if (stk->slot_size[pat->rowptr[level]][j] > 0 && atomicAdd(_stealing_args->found, 0) == 0) {
+                  count_fms_visit(_stealing_args, 1ULL);
+                  if (atomicCAS(_stealing_args->found, 0, 1) == 0) {
+                    *count = 1;
+                  }
                 }
               }
             }
