@@ -366,20 +366,46 @@ MatchResult run_match(GraphPreprocessor& g, Graph* gpu_graph, PatternPreprocesso
 
         std::vector<int> edge_counts(h_req_count, static_cast<int>(p.query_edge_src_for_neugn.size()) + model_num_nodes);
         std::vector<int> token_mask_lens(h_req_count, valid_token_len);
-        log_progress("Running NeuGN forward_batch_from_device for " + std::to_string(h_req_count) + " requests");
-        neugn->forward_batch_from_device(d_edge_src_packed, d_edge_dst_packed, edge_stride,
-                                         d_feat_id_packed, model_num_nodes,
-                                         d_tokens_packed, model_token_len,
-                                         d_subnode_packed, model_token_len,
-                                         edge_counts, token_mask_lens, h_req_count, false);
+        const int forward_chunk_size = 64;
+        const int num_forward_chunks = (h_req_count + forward_chunk_size - 1) / forward_chunk_size;
+        log_progress("Running NeuGN forward/ranking in " + std::to_string(num_forward_chunks) +
+                     " chunks for " + std::to_string(h_req_count) +
+                     " requests; this wrapper evaluates samples sequentially inside each chunk");
+        for (int chunk_begin = 0, chunk_id = 0; chunk_begin < h_req_count; chunk_begin += forward_chunk_size, chunk_id++) {
+          int chunk_count = std::min(forward_chunk_size, h_req_count - chunk_begin);
+          log_progress("NeuGN chunk " + std::to_string(chunk_id + 1) + "/" +
+                       std::to_string(num_forward_chunks) + ": forward requests [" +
+                       std::to_string(chunk_begin) + ", " +
+                       std::to_string(chunk_begin + chunk_count) + ")");
 
-        log_progress("Applying NeuGN ranking and resuming paused warps");
-        apply_neugn_ranking_kernel<<<h_req_count, 1>>>(d_neugn_requests, h_req_count, gpu_callstack,
-                                                       neugn->device_output(), vocab_size);
-        check_cuda(cudaGetLastError(), "apply_neugn_ranking_kernel launch failed");
+          std::vector<int> chunk_edge_counts(edge_counts.begin() + chunk_begin,
+                                             edge_counts.begin() + chunk_begin + chunk_count);
+          std::vector<int> chunk_token_mask_lens(token_mask_lens.begin() + chunk_begin,
+                                                 token_mask_lens.begin() + chunk_begin + chunk_count);
+          neugn->forward_batch_from_device(
+              d_edge_src_packed + static_cast<size_t>(chunk_begin) * static_cast<size_t>(edge_stride),
+              d_edge_dst_packed + static_cast<size_t>(chunk_begin) * static_cast<size_t>(edge_stride),
+              edge_stride,
+              d_feat_id_packed + static_cast<size_t>(chunk_begin) * static_cast<size_t>(model_num_nodes),
+              model_num_nodes,
+              d_tokens_packed + static_cast<size_t>(chunk_begin) * static_cast<size_t>(model_token_len),
+              model_token_len,
+              d_subnode_packed + static_cast<size_t>(chunk_begin) * static_cast<size_t>(model_token_len),
+              model_token_len,
+              chunk_edge_counts, chunk_token_mask_lens, chunk_count, false);
+
+          log_progress("NeuGN chunk " + std::to_string(chunk_id + 1) + "/" +
+                       std::to_string(num_forward_chunks) + ": applying ranking");
+          apply_neugn_ranking_kernel<<<chunk_count, 1>>>(d_neugn_requests + chunk_begin, chunk_count, gpu_callstack,
+                                                         neugn->device_output(), vocab_size);
+          check_cuda(cudaGetLastError(), "apply_neugn_ranking_kernel launch failed");
+          check_cuda(cudaDeviceSynchronize(), "apply_neugn_ranking_kernel failed");
+        }
+
+        log_progress("Resuming paused warps after all NeuGN chunks");
         clear_neugn_pause_kernel<<<(h_req_count + 255) / 256, 256>>>(d_neugn_requests, h_req_count, gpu_callstack);
         check_cuda(cudaGetLastError(), "clear_neugn_pause_kernel launch failed");
-        check_cuda(cudaDeviceSynchronize(), "NeuGN ranking/clear kernels failed");
+        check_cuda(cudaDeviceSynchronize(), "clear_neugn_pause_kernel failed");
       }
 
       int h_active = 0;
