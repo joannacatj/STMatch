@@ -56,8 +56,28 @@ namespace STMatch {
     int length[PAT_SIZE];
     int edge[PAT_SIZE][PAT_SIZE];
 
-    PatternPreprocessor(std::string filename) {
-      readfile(filename);
+    void initialize_pattern_storage() {
+      memset(&pat, 0, sizeof(Pattern));
+      memset(adj_matrix_, 0, sizeof(adj_matrix_));
+      memset(vertex_order_, 0, sizeof(vertex_order_));
+      memset(order_map_, 0, sizeof(order_map_));
+      memset(slot_labels, 0, sizeof(slot_labels));
+      memset(partial, 0, sizeof(partial));
+      memset(set_ops, 0, sizeof(set_ops));
+      memset(length, 0, sizeof(length));
+      memset(edge, 0, sizeof(edge));
+      PatternMultiplicity = 1;
+      L_adj_matrix_.clear();
+      board.clear();
+      vertex_labels.clear();
+      query_edge_src_for_neugn.clear();
+      query_edge_dst_for_neugn.clear();
+      query_labels_for_neugn.clear();
+      query_adj_for_neugn.clear();
+      query_n_for_neugn = 0;
+    }
+
+    void finalize_pattern() {
       build_neugn_query_views();
       get_matching_order();
       get_partial_order();
@@ -65,8 +85,39 @@ namespace STMatch {
       propagate_partial_order();
       get_labels();
       convert2oned();
+    }
+
+    PatternPreprocessor(std::string filename) {
+      initialize_pattern_storage();
+      readfile(filename);
+      finalize_pattern();
 
       //std::cout << "Pattern read complete. Pattern size: " << (int)pat.nnodes << std::endl;
+    }
+
+    PatternPreprocessor(const std::vector<std::vector<int>>& adj_matrix,
+                        const std::vector<int>& compact_vertex_labels) {
+      initialize_pattern_storage();
+      if (compact_vertex_labels.empty() || compact_vertex_labels.size() > PAT_SIZE) {
+        std::cerr << "Generated pattern vertex count must be in [1, " << PAT_SIZE << "]\n";
+        exit(1);
+      }
+      if (adj_matrix.size() != compact_vertex_labels.size()) {
+        std::cerr << "Generated pattern adjacency/label size mismatch\n";
+        exit(1);
+      }
+      pat.nnodes = static_cast<pattern_node_t>(compact_vertex_labels.size());
+      vertex_labels = compact_vertex_labels;
+      for (int i = 0; i < pat.nnodes; i++) {
+        if (adj_matrix[i].size() != compact_vertex_labels.size()) {
+          std::cerr << "Generated pattern adjacency row size mismatch\n";
+          exit(1);
+        }
+        for (int j = 0; j < pat.nnodes; j++) {
+          adj_matrix_[i][j] = adj_matrix[i][j] ? 1 : 0;
+        }
+      }
+      finalize_pattern();
     }
 
     Pattern* to_gpu() {
