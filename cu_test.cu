@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <random>
@@ -202,6 +203,79 @@ std::string describe_generated_query(const GeneratedQuery& q) {
   return out.str();
 }
 
+int read_env_int(const char* name, int default_value) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') return default_value;
+  try {
+    return std::stoi(value);
+  } catch (...) {
+    return default_value;
+  }
+}
+
+void dump_neugn_requests_and_candidates(NeuGNRequest* d_requests, int request_count,
+                                        CallStack* gpu_callstack) {
+  if (request_count <= 0) return;
+  int max_requests = read_env_int("STMATCH_MAX_DUMP_REQUESTS", request_count);
+  int max_candidates = read_env_int("STMATCH_MAX_DUMP_CANDIDATES", 64);
+  if (max_requests < 0) max_requests = request_count;
+  if (max_candidates < 0) max_candidates = GRAPH_DEGREE;
+  max_requests = std::min(max_requests, request_count);
+  max_candidates = std::min(max_candidates, static_cast<int>(GRAPH_DEGREE));
+
+  std::vector<NeuGNRequest> requests(request_count);
+  std::vector<CallStack> callstacks(NWARPS_TOTAL);
+  check_cuda(cudaMemcpy(requests.data(), d_requests, sizeof(NeuGNRequest) * request_count,
+                        cudaMemcpyDeviceToHost),
+             "cudaMemcpy NeuGN requests for dump failed");
+  check_cuda(cudaMemcpy(callstacks.data(), gpu_callstack, sizeof(CallStack) * NWARPS_TOTAL,
+                        cudaMemcpyDeviceToHost),
+             "cudaMemcpy CallStack for NeuGN dump failed");
+
+  std::cerr << "[STMatch][neugn_dump] request_count=" << request_count
+            << ", printing_requests=" << max_requests
+            << ", max_candidates_per_request=" << max_candidates
+            << " (override with STMATCH_MAX_DUMP_REQUESTS / STMATCH_MAX_DUMP_CANDIDATES)"
+            << std::endl;
+
+  for (int rid = 0; rid < max_requests; rid++) {
+    const NeuGNRequest& req = requests[rid];
+    std::cerr << "[STMatch][neugn_dump] request=" << rid
+              << " warp=" << req.warp_id
+              << " level=" << req.level
+              << " slot=" << req.slot
+              << " unroll=" << req.unroll_id
+              << " qnode=" << req.qnode
+              << " cand_len=" << req.cand_len
+              << " mapping=[";
+    for (int i = 0; i < PAT_SIZE; i++) {
+      if (i) std::cerr << ",";
+      std::cerr << req.mapping[i];
+    }
+    std::cerr << "] candidates=[";
+
+    int copy_len = std::min(req.cand_len, max_candidates);
+    std::vector<graph_node_t> candidates(std::max(0, copy_len));
+    if (req.warp_id >= 0 && req.warp_id < NWARPS_TOTAL && req.slot >= 0 &&
+        req.slot < static_cast<int>(MAX_SLOT_NUM) && req.unroll_id >= 0 &&
+        req.unroll_id < UNROLL && copy_len > 0) {
+      graph_node_t* d_cands = &callstacks[req.warp_id].slot_storage[req.slot][req.unroll_id][0];
+      check_cuda(cudaMemcpy(candidates.data(), d_cands, sizeof(graph_node_t) * copy_len,
+                            cudaMemcpyDeviceToHost),
+                 "cudaMemcpy NeuGN candidate list for dump failed");
+      for (int i = 0; i < copy_len; i++) {
+        if (i) std::cerr << ",";
+        std::cerr << candidates[i];
+      }
+      if (req.cand_len > copy_len) std::cerr << ",...";
+    }
+    else {
+      std::cerr << "<invalid-request-metadata>";
+    }
+    std::cerr << "]" << std::endl;
+  }
+}
+
 MatchResult run_match(GraphPreprocessor& g, Graph* gpu_graph, PatternPreprocessor& p,
                       const std::string& query_name, bool enable_neugn_runtime,
                       NeuGNCudaModel* neugn, const std::string& neugn_export_dir) {
@@ -354,6 +428,7 @@ MatchResult run_match(GraphPreprocessor& g, Graph* gpu_graph, PatternPreprocesso
                    ", neugn_requests=" + std::to_string(h_req_count));
 
       if (h_req_count > 0) {
+        dump_neugn_requests_and_candidates(d_neugn_requests, h_req_count, gpu_callstack);
         log_progress("Building NeuGN batch inputs for " + std::to_string(h_req_count) + " requests");
         build_neugn_batch_inputs_kernel<<<h_req_count, 256>>>(
             d_neugn_requests, h_req_count, d_q_edge_src, d_q_edge_dst,
@@ -366,46 +441,20 @@ MatchResult run_match(GraphPreprocessor& g, Graph* gpu_graph, PatternPreprocesso
 
         std::vector<int> edge_counts(h_req_count, static_cast<int>(p.query_edge_src_for_neugn.size()) + model_num_nodes);
         std::vector<int> token_mask_lens(h_req_count, valid_token_len);
-        const int forward_chunk_size = 64;
-        const int num_forward_chunks = (h_req_count + forward_chunk_size - 1) / forward_chunk_size;
-        log_progress("Running NeuGN forward/ranking in " + std::to_string(num_forward_chunks) +
-                     " chunks for " + std::to_string(h_req_count) +
-                     " requests; this wrapper evaluates samples sequentially inside each chunk");
-        for (int chunk_begin = 0, chunk_id = 0; chunk_begin < h_req_count; chunk_begin += forward_chunk_size, chunk_id++) {
-          int chunk_count = std::min(forward_chunk_size, h_req_count - chunk_begin);
-          log_progress("NeuGN chunk " + std::to_string(chunk_id + 1) + "/" +
-                       std::to_string(num_forward_chunks) + ": forward requests [" +
-                       std::to_string(chunk_begin) + ", " +
-                       std::to_string(chunk_begin + chunk_count) + ")");
+        log_progress("Running NeuGN forward_batch_from_device for " + std::to_string(h_req_count) + " requests");
+        neugn->forward_batch_from_device(d_edge_src_packed, d_edge_dst_packed, edge_stride,
+                                         d_feat_id_packed, model_num_nodes,
+                                         d_tokens_packed, model_token_len,
+                                         d_subnode_packed, model_token_len,
+                                         edge_counts, token_mask_lens, h_req_count, false);
 
-          std::vector<int> chunk_edge_counts(edge_counts.begin() + chunk_begin,
-                                             edge_counts.begin() + chunk_begin + chunk_count);
-          std::vector<int> chunk_token_mask_lens(token_mask_lens.begin() + chunk_begin,
-                                                 token_mask_lens.begin() + chunk_begin + chunk_count);
-          neugn->forward_batch_from_device(
-              d_edge_src_packed + static_cast<size_t>(chunk_begin) * static_cast<size_t>(edge_stride),
-              d_edge_dst_packed + static_cast<size_t>(chunk_begin) * static_cast<size_t>(edge_stride),
-              edge_stride,
-              d_feat_id_packed + static_cast<size_t>(chunk_begin) * static_cast<size_t>(model_num_nodes),
-              model_num_nodes,
-              d_tokens_packed + static_cast<size_t>(chunk_begin) * static_cast<size_t>(model_token_len),
-              model_token_len,
-              d_subnode_packed + static_cast<size_t>(chunk_begin) * static_cast<size_t>(model_token_len),
-              model_token_len,
-              chunk_edge_counts, chunk_token_mask_lens, chunk_count, false);
-
-          log_progress("NeuGN chunk " + std::to_string(chunk_id + 1) + "/" +
-                       std::to_string(num_forward_chunks) + ": applying ranking");
-          apply_neugn_ranking_kernel<<<chunk_count, 1>>>(d_neugn_requests + chunk_begin, chunk_count, gpu_callstack,
-                                                         neugn->device_output(), vocab_size);
-          check_cuda(cudaGetLastError(), "apply_neugn_ranking_kernel launch failed");
-          check_cuda(cudaDeviceSynchronize(), "apply_neugn_ranking_kernel failed");
-        }
-
-        log_progress("Resuming paused warps after all NeuGN chunks");
+        log_progress("Applying NeuGN ranking and resuming paused warps");
+        apply_neugn_ranking_kernel<<<h_req_count, 1>>>(d_neugn_requests, h_req_count, gpu_callstack,
+                                                       neugn->device_output(), vocab_size);
+        check_cuda(cudaGetLastError(), "apply_neugn_ranking_kernel launch failed");
         clear_neugn_pause_kernel<<<(h_req_count + 255) / 256, 256>>>(d_neugn_requests, h_req_count, gpu_callstack);
         check_cuda(cudaGetLastError(), "clear_neugn_pause_kernel launch failed");
-        check_cuda(cudaDeviceSynchronize(), "clear_neugn_pause_kernel failed");
+        check_cuda(cudaDeviceSynchronize(), "NeuGN ranking/clear kernels failed");
       }
 
       int h_active = 0;
