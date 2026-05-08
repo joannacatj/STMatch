@@ -24,6 +24,10 @@ void check_cuda(cudaError_t status, const char* what) {
   }
 }
 
+void log_progress(const std::string& message) {
+  std::cerr << "[STMatch][progress] " << message << std::endl;
+}
+
 std::vector<int> build_path_fallback(std::vector<std::vector<int>> query_adj) {
   const int n = static_cast<int>(query_adj.size());
   for (auto& adj : query_adj) std::sort(adj.begin(), adj.end());
@@ -89,9 +93,12 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
+  log_progress("Selecting CUDA device 0");
   check_cuda(cudaSetDevice(0), "cudaSetDevice failed");
 
+  log_progress(std::string("Loading data graph: ") + argv[1]);
   STMatch::GraphPreprocessor g(argv[1]);
+  log_progress(std::string("Loading query graph: ") + argv[2]);
   STMatch::PatternPreprocessor p(argv[2]);
 
   NeuGNCudaModel neugn;
@@ -105,11 +112,16 @@ int main(int argc, char* argv[]) {
 
   if (USE_NEUGN) {
     const std::string neugn_export_dir = argv[3];
+    log_progress(std::string("Loading NeuGN model from: ") + neugn_export_dir);
     neugn.load_model(neugn_export_dir);
     model_num_nodes = neugn.num_nodes();
     model_token_len = neugn.token_len();
     vocab_size = neugn.vocab_size();
     edge_stride = neugn.max_edges_with_self_loops();
+    log_progress("NeuGN model loaded: num_nodes=" + std::to_string(model_num_nodes) +
+                 ", token_len=" + std::to_string(model_token_len) +
+                 ", vocab_size=" + std::to_string(vocab_size) +
+                 ", edge_stride=" + std::to_string(edge_stride));
 
     if (p.query_n_for_neugn > model_num_nodes) {
       std::cerr << "Query nodes exceed NeuGN model capacity: " << p.query_n_for_neugn
@@ -125,9 +137,14 @@ int main(int argc, char* argv[]) {
     int sub_node_id_size = read_sub_node_id_size(neugn_export_dir);
     node2sub = build_node2sub(query_path, p.query_n_for_neugn, sub_node_id_size);
     valid_token_len = std::min(static_cast<int>(query_path.size()) + 1, model_token_len);
+    log_progress("NeuGN query metadata ready: query_nodes=" + std::to_string(p.query_n_for_neugn) +
+                 ", directed_edges=" + std::to_string(p.query_edge_src_for_neugn.size()) +
+                 ", path_len=" + std::to_string(query_path.size()) +
+                 ", valid_token_len=" + std::to_string(valid_token_len));
   }
 
   // copy graph and pattern to GPU global memory
+  log_progress("Copying graph, pattern, and initial job queue to GPU");
   Graph* gpu_graph = g.to_gpu();
   Pattern* gpu_pattern = p.to_gpu();
   JobQueue* gpu_queue = JobQueuePreprocessor(g.g, p).to_gpu();
@@ -184,7 +201,10 @@ int main(int argc, char* argv[]) {
   int64_t *d_tokens_packed = nullptr, *d_subnode_packed = nullptr;
   int *d_q_edge_src = nullptr, *d_q_edge_dst = nullptr, *d_q_labels = nullptr, *d_query_path = nullptr, *d_node2sub = nullptr;
 
+  log_progress("Base GPU buffers allocated and initialized");
+
   if (USE_NEUGN) {
+    log_progress("Allocating NeuGN request and batch input buffers on GPU");
     check_cuda(cudaMalloc(&d_neugn_requests, sizeof(NeuGNRequest) * NEUGN_BATCH_CAPACITY), "cudaMalloc d_neugn_requests failed");
     check_cuda(cudaMalloc(&d_neugn_request_count, sizeof(int)), "cudaMalloc d_neugn_request_count failed");
     check_cuda(cudaMalloc(&d_active_warps, sizeof(int)), "cudaMalloc d_active_warps failed");
@@ -210,6 +230,7 @@ int main(int argc, char* argv[]) {
     if (!query_path.empty()) {
       check_cuda(cudaMemcpy(d_query_path, query_path.data(), sizeof(int) * query_path.size(), cudaMemcpyHostToDevice), "cudaMemcpy d_query_path failed");
     }
+    log_progress("NeuGN device buffers and query metadata copied");
   }
 
   cudaEvent_t start, stop;
@@ -218,9 +239,11 @@ int main(int argc, char* argv[]) {
   cudaEventRecord(start);
 
   int launch_count = 0;
+  log_progress(USE_NEUGN ? "Starting multi-kernel STMatch + NeuGN loop" : "Starting single-kernel STMatch search");
   if (USE_NEUGN) {
     while (true) {
       launch_count++;
+      log_progress("Launching STMatch DFS kernel, iteration=" + std::to_string(launch_count));
       check_cuda(cudaMemset(d_neugn_request_count, 0, sizeof(int)), "cudaMemset d_neugn_request_count failed");
       check_cuda(cudaMemset(d_active_warps, 0, sizeof(int)), "cudaMemset d_active_warps failed");
       check_cuda(cudaMemset(idle_warps, 0, sizeof(int) * GRID_DIM), "cudaMemset idle_warps failed");
@@ -236,8 +259,13 @@ int main(int argc, char* argv[]) {
       int h_req_count_raw = 0;
       check_cuda(cudaMemcpy(&h_req_count_raw, d_neugn_request_count, sizeof(int), cudaMemcpyDeviceToHost), "cudaMemcpy request count failed");
       int h_req_count = std::min(h_req_count_raw, NEUGN_BATCH_CAPACITY);
+      log_progress("STMatch kernel finished, iteration=" + std::to_string(launch_count) +
+                   ", neugn_requests=" + std::to_string(h_req_count) +
+                   (h_req_count_raw > NEUGN_BATCH_CAPACITY ?
+                    ", request_buffer_capped_from=" + std::to_string(h_req_count_raw) : ""));
 
       if (h_req_count > 0) {
+        log_progress("Building NeuGN batch inputs for " + std::to_string(h_req_count) + " requests");
         build_neugn_batch_inputs_kernel<<<h_req_count, 256>>>(
             d_neugn_requests, h_req_count, d_q_edge_src, d_q_edge_dst,
             static_cast<int>(p.query_edge_src_for_neugn.size()), d_q_labels, p.query_n_for_neugn,
@@ -249,12 +277,14 @@ int main(int argc, char* argv[]) {
 
         std::vector<int> edge_counts(h_req_count, static_cast<int>(p.query_edge_src_for_neugn.size()) + model_num_nodes);
         std::vector<int> token_mask_lens(h_req_count, valid_token_len);
+        log_progress("Running NeuGN forward_batch_from_device for " + std::to_string(h_req_count) + " requests");
         neugn.forward_batch_from_device(d_edge_src_packed, d_edge_dst_packed, edge_stride,
                                         d_feat_id_packed, model_num_nodes,
                                         d_tokens_packed, model_token_len,
                                         d_subnode_packed, model_token_len,
                                         edge_counts, token_mask_lens, h_req_count, false);
 
+        log_progress("Applying NeuGN ranking and resuming paused warps");
         apply_neugn_ranking_kernel<<<h_req_count, 1>>>(d_neugn_requests, h_req_count, gpu_callstack,
                                                        neugn.device_output(), vocab_size);
         check_cuda(cudaGetLastError(), "apply_neugn_ranking_kernel launch failed");
@@ -265,22 +295,33 @@ int main(int argc, char* argv[]) {
 
       int h_active = 0;
       check_cuda(cudaMemcpy(&h_active, d_active_warps, sizeof(int), cudaMemcpyDeviceToHost), "cudaMemcpy active_warps failed");
+      log_progress("Iteration=" + std::to_string(launch_count) +
+                   " complete, active_warps=" + std::to_string(h_active));
       if (FIND_FIRST) {
         int found = 0;
         check_cuda(cudaMemcpy(&found, gpu_found, sizeof(int), cudaMemcpyDeviceToHost), "cudaMemcpy found failed");
-        if (found) break;
+        if (found) {
+          log_progress("Find-first match found; stopping search loop");
+          break;
+        }
       }
-      if (h_active == 0 && h_req_count == 0) break;
+      if (h_active == 0 && h_req_count == 0) {
+        log_progress("No active warps and no NeuGN requests remain; stopping search loop");
+        break;
+      }
     }
   }
   else {
     launch_count = 1;
+    log_progress("Launching STMatch DFS kernel");
     launch_parallel_match(gpu_graph, gpu_pattern, gpu_callstack, gpu_queue, gpu_res,
                           idle_warps, idle_warps_count, global_mutex, gpu_found, gpu_fms);
     check_cuda(cudaGetLastError(), "Kernel launch failed");
     check_cuda(cudaDeviceSynchronize(), "Kernel execution failed");
+    log_progress("STMatch DFS kernel finished");
   }
 
+  log_progress("Collecting results from GPU");
   cudaEventRecord(stop);
   check_cuda(cudaEventSynchronize(stop), "Timing synchronize failed");
 
@@ -302,6 +343,11 @@ int main(int argc, char* argv[]) {
   else if (!LABELED) {
     tot_count = tot_count * p.PatternMultiplicity;
   }
+
+  log_progress("Search complete: elapsed_ms=" + std::to_string(milliseconds) +
+               ", count=" + std::to_string(tot_count) +
+               (FIND_FIRST ? ", fms=" + std::to_string(fms) : "") +
+               ", launches=" + std::to_string(launch_count));
 
   if (USE_NEUGN && FIND_FIRST) {
     printf("%s\t%f\t%llu\t%llu\t%d\n", argv[2], milliseconds, tot_count, fms, launch_count);
