@@ -36,6 +36,11 @@ namespace STMatch {
     }
   }
 
+  __forceinline__ __device__ bool neugn_pause_requested(StealingArgs* args) {
+    return USE_NEUGN && args->neugn_request_count != nullptr &&
+           atomicAdd(args->neugn_request_count, 0) > 0;
+  }
+
   __device__ bool trans_layer(CallStack& _target_stk, CallStack& _cur_stk, Pattern* _pat, int _k, int ratio = 2) {
     if (_target_stk.level <= _k)
       return false;
@@ -845,7 +850,8 @@ namespace STMatch {
       match(&graph, &pat, &stk[local_wid], job_queue, &count[local_wid], &stealing_args, global_wid);
       bool stop_after_match = find_first_done(&stealing_args);
       bool paused_after_match = USE_NEUGN && stk[local_wid].paused_for_neugn;
-      if (__syncthreads_or(stop_after_match || paused_after_match)) {
+      bool host_pause_after_match = neugn_pause_requested(&stealing_args);
+      if (__syncthreads_or(stop_after_match || paused_after_match || host_pause_after_match)) {
         break;
       }
 
@@ -876,9 +882,10 @@ namespace STMatch {
 
             while ((atomicAdd(stealing_args.idle_warps_count, 0) < NWARPS_TOTAL) &&
                    (atomicAdd(&stealing_args.idle_warps[blockIdx.x], 0) & (1 << local_wid)) &&
-                   !find_first_done(&stealing_args));
+                   !find_first_done(&stealing_args) &&
+                   !neugn_pause_requested(&stealing_args));
 
-            if (find_first_done(&stealing_args)) {
+            if (find_first_done(&stealing_args) || neugn_pause_requested(&stealing_args)) {
               lock(&(stealing_args.global_mutex[blockIdx.x]));
               atomicAnd(&stealing_args.idle_warps[blockIdx.x], ~(1 << local_wid));
               unlock(&(stealing_args.global_mutex[blockIdx.x]));
