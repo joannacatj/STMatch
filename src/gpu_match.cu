@@ -41,6 +41,20 @@ namespace STMatch {
            atomicAdd(args->neugn_request_count, 0) > 0;
   }
 
+  // FMS counts candidate assignments that are actually expanded. With loop
+  // unrolling, one DFS advance can expand a batch of assignments, but it must
+  // not count the generated candidate-list length.
+  __forceinline__ __device__ unsigned long long fms_assignment_visits(
+      CallStack* stk, Pattern* pat, int level) {
+    int slot = pat->rowptr[level];
+    int u = stk->uiter[level];
+    int remaining = stk->slot_size[slot][u] - stk->iter[level];
+    if (remaining <= 0) return 0ULL;
+    int unroll_visits = UNROLL_SIZE(level + 1);
+    int visits = remaining < unroll_visits ? remaining : unroll_visits;
+    return static_cast<unsigned long long>(visits) * (level == 0 ? 2ULL : 1ULL);
+  }
+
   __device__ bool trans_layer(CallStack& _target_stk, CallStack& _cur_stk, Pattern* _pat, int _k, int ratio = 2) {
     if (_target_stk.level <= _k)
       return false;
@@ -739,7 +753,7 @@ namespace STMatch {
         if (stk->uiter[level] < UNROLL_SIZE(level)) {
           if (stk->iter[level] < stk->slot_size[pat->rowptr[level]][stk->uiter[level]]) {
             if (threadIdx.x % WARP_SIZE == 0) {
-              count_fms_visit(_stealing_args, level == 0 ? 2 : 1);
+              count_fms_visit(_stealing_args, fms_assignment_visits(stk, pat, level));
               level++;
             }
             __syncwarp();
