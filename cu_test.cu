@@ -213,6 +213,85 @@ int read_env_int(const char* name, int default_value) {
   }
 }
 
+void validate_neugn_model_compatibility(const GraphPreprocessor& g,
+                                         const PatternPreprocessor& p,
+                                         const NeuGNCudaModel& neugn,
+                                         int sub_node_id_size) {
+  const int padding_id = g.g.nnodes;
+  const int sos_id = g.g.nnodes + 1;
+  bool ok = true;
+
+  auto fail = [&](const std::string& message) {
+    std::cerr << "[STMatch][neugn_check][ERROR] " << message << std::endl;
+    ok = false;
+  };
+  auto warn = [&](const std::string& message) {
+    std::cerr << "[STMatch][neugn_check][WARN] " << message << std::endl;
+  };
+
+  if (p.query_n_for_neugn > neugn.num_nodes()) {
+    fail("query node count " + std::to_string(p.query_n_for_neugn) +
+         " exceeds model num_nodes " + std::to_string(neugn.num_nodes()));
+  }
+  if (static_cast<int>(p.query_edge_src_for_neugn.size()) + neugn.num_nodes() >
+      neugn.max_edges_with_self_loops()) {
+    fail("query directed edge count + self loops exceeds model edge capacity: " +
+         std::to_string(p.query_edge_src_for_neugn.size()) + " + " +
+         std::to_string(neugn.num_nodes()) + " > " +
+         std::to_string(neugn.max_edges_with_self_loops()));
+  }
+  if (neugn.vocab_size() < g.g.nnodes) {
+    fail("decoder output_dim/vocab_size " + std::to_string(neugn.vocab_size()) +
+         " is smaller than data graph node count " + std::to_string(g.g.nnodes) +
+         "; candidate logits would be missing for some data vertices");
+  }
+  if (neugn.token_vocab_size() <= sos_id) {
+    fail("decoder token embedding rows " + std::to_string(neugn.token_vocab_size()) +
+         " cannot index padding_id=" + std::to_string(padding_id) +
+         " and sos_id=" + std::to_string(sos_id) +
+         "; NeuGN token input would read out of bounds");
+  }
+  if (sub_node_id_size > neugn.subnode_vocab_size()) {
+    fail("sub_node_id_size " + std::to_string(sub_node_id_size) +
+         " exceeds decoder.node_embeddings rows " +
+         std::to_string(neugn.subnode_vocab_size()));
+  }
+  if (sub_node_id_size <= 0) {
+    fail("sub_node_id_size must be positive, got " + std::to_string(sub_node_id_size));
+  }
+  for (int i = 0; i < static_cast<int>(p.query_labels_for_neugn.size()); i++) {
+    int label = p.query_labels_for_neugn[i];
+    if (label < 0 || label >= neugn.encoder_label_vocab_size()) {
+      fail("query label id at qnode " + std::to_string(i) + " is " +
+           std::to_string(label) + ", outside encoder.value_embedding rows [0, " +
+           std::to_string(neugn.encoder_label_vocab_size() - 1) + "]");
+    }
+  }
+  if (neugn.token_vocab_size() != neugn.vocab_size()) {
+    warn("token embedding rows (" + std::to_string(neugn.token_vocab_size()) +
+         ") differ from output vocab/logit rows (" +
+         std::to_string(neugn.vocab_size()) +
+         "); ranking uses output logits, token inputs use token embeddings");
+  }
+
+  std::cerr << "[STMatch][neugn_check] data_nodes=" << g.g.nnodes
+            << " padding_id=" << padding_id
+            << " sos_id=" << sos_id
+            << " model_num_nodes=" << neugn.num_nodes()
+            << " output_vocab=" << neugn.vocab_size()
+            << " token_vocab=" << neugn.token_vocab_size()
+            << " encoder_label_vocab=" << neugn.encoder_label_vocab_size()
+            << " subnode_vocab=" << neugn.subnode_vocab_size()
+            << " sub_node_id_size=" << sub_node_id_size
+            << std::endl;
+
+  if (!ok) {
+    std::cerr << "[STMatch][neugn_check] NeuGN input/model compatibility check failed; "
+              << "not running forward with invalid embedding/logit indices." << std::endl;
+    std::exit(1);
+  }
+}
+
 void dump_neugn_requests_and_candidates(NeuGNRequest* d_requests, int request_count,
                                         CallStack* gpu_callstack) {
   if (request_count <= 0) return;
@@ -281,20 +360,14 @@ MatchResult run_match(GraphPreprocessor& g, Graph* gpu_graph, PatternPreprocesso
                       NeuGNCudaModel* neugn, const std::string& neugn_export_dir) {
   MatchResult result;
 
+  int sub_node_id_size = 32;
   if (enable_neugn_runtime) {
     if (neugn == nullptr) {
       std::cerr << "NeuGN runtime requested but model is not loaded\n";
       std::exit(1);
     }
-    if (p.query_n_for_neugn > neugn->num_nodes()) {
-      std::cerr << "Query nodes exceed NeuGN model capacity: " << p.query_n_for_neugn
-                << " > " << neugn->num_nodes() << std::endl;
-      std::exit(1);
-    }
-    if (static_cast<int>(p.query_edge_src_for_neugn.size()) + neugn->num_nodes() > neugn->max_edges_with_self_loops()) {
-      std::cerr << "Query edge inputs exceed NeuGN edge stride" << std::endl;
-      std::exit(1);
-    }
+    sub_node_id_size = read_sub_node_id_size(neugn_export_dir);
+    validate_neugn_model_compatibility(g, p, *neugn, sub_node_id_size);
   }
 
   log_progress(std::string("Preparing GPU state for query: ") + query_name +
@@ -369,7 +442,6 @@ MatchResult run_match(GraphPreprocessor& g, Graph* gpu_graph, PatternPreprocesso
     vocab_size = neugn->vocab_size();
     edge_stride = neugn->max_edges_with_self_loops();
     query_path = build_path_fallback(p.query_adj_for_neugn);
-    int sub_node_id_size = read_sub_node_id_size(neugn_export_dir);
     node2sub = build_node2sub(query_path, p.query_n_for_neugn, sub_node_id_size);
     valid_token_len = std::min(static_cast<int>(query_path.size()) + 1, model_token_len);
 
@@ -567,7 +639,10 @@ void run_random_walk_compare(int argc, char* argv[]) {
   neugn.load_model(neugn_export_dir);
   log_progress("NeuGN model loaded: num_nodes=" + std::to_string(neugn.num_nodes()) +
                ", token_len=" + std::to_string(neugn.token_len()) +
-               ", vocab_size=" + std::to_string(neugn.vocab_size()) +
+               ", output_vocab=" + std::to_string(neugn.vocab_size()) +
+               ", token_vocab=" + std::to_string(neugn.token_vocab_size()) +
+               ", encoder_label_vocab=" + std::to_string(neugn.encoder_label_vocab_size()) +
+               ", subnode_vocab=" + std::to_string(neugn.subnode_vocab_size()) +
                ", edge_stride=" + std::to_string(neugn.max_edges_with_self_loops()));
 
   std::mt19937 rng(seed);
@@ -627,7 +702,10 @@ int main(int argc, char* argv[]) {
     neugn.load_model(neugn_export_dir);
     log_progress("NeuGN model loaded: num_nodes=" + std::to_string(neugn.num_nodes()) +
                  ", token_len=" + std::to_string(neugn.token_len()) +
-                 ", vocab_size=" + std::to_string(neugn.vocab_size()) +
+                 ", output_vocab=" + std::to_string(neugn.vocab_size()) +
+                 ", token_vocab=" + std::to_string(neugn.token_vocab_size()) +
+                 ", encoder_label_vocab=" + std::to_string(neugn.encoder_label_vocab_size()) +
+                 ", subnode_vocab=" + std::to_string(neugn.subnode_vocab_size()) +
                  ", edge_stride=" + std::to_string(neugn.max_edges_with_self_loops()));
     neugn_ptr = &neugn;
     enable_neugn_runtime = true;

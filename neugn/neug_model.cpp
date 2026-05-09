@@ -258,6 +258,9 @@ void NeuGNCudaModel::clear_cuda() {
     batch_capacity_ = 0;
     output_host_.clear();
     output_shape_.clear();
+    encoder_label_vocab_ = 0;
+    token_vocab_ = 0;
+    subnode_vocab_ = 0;
 }
 
 float* NeuGNCudaModel::load_weight_to_device(const std::string& name) {
@@ -330,11 +333,17 @@ void NeuGNCudaModel::load_model(const std::string& export_dir) {
     }
 
     // Validate embeddings.
+    encoder_label_vocab_ = static_cast<int>(manifest_.at("encoder.value_embedding.weight").shape.at(0));
     enc_in_dim_ = static_cast<int>(manifest_.at("encoder.value_embedding.weight").shape.at(1));
+    token_vocab_ = static_cast<int>(manifest_.at("decoder.tok_embeddings.weight").shape.at(0));
+    subnode_vocab_ = static_cast<int>(manifest_.at("decoder.node_embeddings.ne").shape.at(0));
+    if (encoder_label_vocab_ <= 0 || token_vocab_ <= 0 || subnode_vocab_ <= 0) {
+        throw std::runtime_error("Invalid embedding vocabulary sizes in manifest.tsv");
+    }
     if (enc_in_dim_ <= 0) throw std::runtime_error("Invalid encoder embedding dim: " + std::to_string(enc_in_dim_));
-    require_2d_shape(manifest_, "encoder.value_embedding.weight", manifest_.at("encoder.value_embedding.weight").shape.at(0), enc_in_dim_);
-    require_2d_shape(manifest_, "decoder.tok_embeddings.weight", manifest_.at("decoder.tok_embeddings.weight").shape.at(0), dim_);
-    require_2d_shape(manifest_, "decoder.node_embeddings.ne", manifest_.at("decoder.node_embeddings.ne").shape.at(0), dim_);
+    require_2d_shape(manifest_, "encoder.value_embedding.weight", encoder_label_vocab_, enc_in_dim_);
+    require_2d_shape(manifest_, "decoder.tok_embeddings.weight", token_vocab_, dim_);
+    require_2d_shape(manifest_, "decoder.node_embeddings.ne", subnode_vocab_, dim_);
     require_2d_shape(manifest_, "decoder.type_embeddings.weight", manifest_.at("decoder.type_embeddings.weight").shape.at(0), dim_);
 
     auto pos_it = manifest_.find("decoder.pos_embeddings.pe");
