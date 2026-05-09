@@ -8,6 +8,8 @@
 namespace STMatch {
 
    typedef struct {
+    int active;
+    int paused_for_neugn;
     graph_node_t iter[PAT_SIZE];
     graph_node_t uiter[PAT_SIZE];
     graph_node_t slot_size[MAX_SLOT_NUM][UNROLL];

@@ -4,9 +4,8 @@ inline constexpr bool EDGE_INDUCED = true;
 inline constexpr bool STEAL_IN_BLOCK = true;
 inline constexpr bool STEAL_ACROSS_BLOCK = true;
 inline constexpr bool FIND_FIRST = true;
-
-inline constexpr bool USE_NEUGN = false;
-inline constexpr bool MULTI_KERNEL_DFS = false;
+inline constexpr bool MULTI_KERNEL_DFS = true;
+inline constexpr bool USE_NEUGN = true;
 inline constexpr int NEUGN_START_LEVEL = 1;
 inline constexpr int NEUGN_END_LEVEL = 4;
 inline constexpr int NEUGN_BATCH_CAPACITY = 4096;

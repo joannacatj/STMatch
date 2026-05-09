@@ -83,6 +83,9 @@ public:
     int vocab_size() const { return vocab_; }
     int max_edges_without_self_loops() const { return max_edges_without_self_loop_; }
     int max_edges_with_self_loops() const { return input_edge_capacity_; }
+    int encoder_label_vocab_size() const { return encoder_label_vocab_; }
+    int token_vocab_size() const { return token_vocab_; }
+    int subnode_vocab_size() const { return subnode_vocab_; }
 
 private:
     std::string export_dir_;
@@ -103,6 +106,9 @@ private:
     int ffn_dim_ = 0;
     int out_hidden_dim_ = 0;
     int vocab_ = 0;
+    int encoder_label_vocab_ = 0;
+    int token_vocab_ = 0;
+    int subnode_vocab_ = 0;
     float norm_eps_ = 1e-5f;
 
     // Output.

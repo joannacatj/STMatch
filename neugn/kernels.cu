@@ -157,8 +157,12 @@ __global__ void attention_mask_row_kernel(float* scores, int seq, int heads, int
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = heads * seq * seq;
     if (idx < total) {
-        int i = (idx / seq) % seq;
-        if (i >= valid_rows) scores[idx] = -1e30f;
+        // scores are laid out as [head, query_row, key_col]. Padding tokens
+        // must be masked as keys/columns so valid query rows cannot attend to
+        // padding embeddings. Masking query rows instead leaves padding columns
+        // visible to the output row and corrupts NeuGN ranking.
+        int j = idx % seq;
+        if (j >= valid_rows) scores[idx] = -1e30f;
     }
 }
 
