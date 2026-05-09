@@ -39,9 +39,7 @@ void check_cuda(cudaError_t status, const char* what) {
   }
 }
 
-void log_progress(const std::string& message) {
-  std::cerr << "[STMatch][progress] " << message << std::endl;
-}
+void log_progress(const std::string&) {}
 
 int bitidx(bitarray32 a) {
   for (int i = 0; i < 32; i++) {
@@ -225,10 +223,6 @@ void validate_neugn_model_compatibility(const GraphPreprocessor& g,
     std::cerr << "[STMatch][neugn_check][ERROR] " << message << std::endl;
     ok = false;
   };
-  auto warn = [&](const std::string& message) {
-    std::cerr << "[STMatch][neugn_check][WARN] " << message << std::endl;
-  };
-
   if (p.query_n_for_neugn > neugn.num_nodes()) {
     fail("query node count " + std::to_string(p.query_n_for_neugn) +
          " exceeds model num_nodes " + std::to_string(neugn.num_nodes()));
@@ -267,24 +261,6 @@ void validate_neugn_model_compatibility(const GraphPreprocessor& g,
            std::to_string(neugn.encoder_label_vocab_size() - 1) + "]");
     }
   }
-  if (neugn.token_vocab_size() != neugn.vocab_size()) {
-    warn("token embedding rows (" + std::to_string(neugn.token_vocab_size()) +
-         ") differ from output vocab/logit rows (" +
-         std::to_string(neugn.vocab_size()) +
-         "); ranking uses output logits, token inputs use token embeddings");
-  }
-
-  std::cerr << "[STMatch][neugn_check] data_nodes=" << g.g.nnodes
-            << " padding_id=" << padding_id
-            << " sos_id=" << sos_id
-            << " model_num_nodes=" << neugn.num_nodes()
-            << " output_vocab=" << neugn.vocab_size()
-            << " token_vocab=" << neugn.token_vocab_size()
-            << " encoder_label_vocab=" << neugn.encoder_label_vocab_size()
-            << " subnode_vocab=" << neugn.subnode_vocab_size()
-            << " sub_node_id_size=" << sub_node_id_size
-            << std::endl;
-
   if (!ok) {
     std::cerr << "[STMatch][neugn_check] NeuGN input/model compatibility check failed; "
               << "not running forward with invalid embedding/logit indices." << std::endl;
@@ -500,7 +476,7 @@ MatchResult run_match(GraphPreprocessor& g, Graph* gpu_graph, PatternPreprocesso
                    ", neugn_requests=" + std::to_string(h_req_count));
 
       if (h_req_count > 0) {
-        dump_neugn_requests_and_candidates(d_neugn_requests, h_req_count, gpu_callstack);
+        if (DEBUG_NEUGN_INPUT) dump_neugn_requests_and_candidates(d_neugn_requests, h_req_count, gpu_callstack);
         log_progress("Building NeuGN batch inputs for " + std::to_string(h_req_count) + " requests");
         build_neugn_batch_inputs_kernel<<<h_req_count, 256>>>(
             d_neugn_requests, h_req_count, d_q_edge_src, d_q_edge_dst,
